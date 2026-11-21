@@ -1,1 +1,288 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create project files
+        run: |
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "VoiceAssistant"
+          include(":app")
+          EOF
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p .
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.voiceassistant"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.voiceassistant"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
 
+              <queries>
+                  <intent><action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" /></intent>
+                  <intent><action android:name="android.speech.RecognitionService" /></intent>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
+              </queries>
+
+              <application android:label="Voice Assistant"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".AssistantService" android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/example/voiceassistant
+          cat > app/src/main/java/com/example/voiceassistant/MainActivity.kt <<'EOF'
+          package com.example.voiceassistant
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.util.Locale
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private var recognizer: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var listening = false
+              private val ui = Handler(Looper.getMainLooper())
+
+              private val aliases = mapOf(
+                  "ফেসবুক" to "facebook", "হোয়াটসঅ্যাপ" to "whatsapp", "ইউটিউব" to "youtube",
+                  "ক্রোম" to "chrome", "ক্যামেরা" to "camera", "সেটিংস" to "settings",
+                  "গ্যালারি" to "photos", "মেসেঞ্জার" to "messenger", "টেলিগ্রাম" to "telegram",
+                  "ম্যাপ" to "maps", "জিমেইল" to "gmail", "ইনস্টাগ্রাম" to "instagram",
+                  "ক্যালকুলেটর" to "calculator", "ঘড়ি" to "clock", "ফোন" to "phone"
+              )
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  status = TextView(this).apply { text = "প্রস্তুত"; textSize = 20f; gravity = Gravity.CENTER }
+                  val start = Button(this).apply { text = "শোনা শুরু / বন্ধ"; setOnClickListener { toggle() } }
+                  val acc = Button(this).apply {
+                      text = "Accessibility চালু করো"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  }
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48)
+                      addView(status); addView(start); addView(acc)
+                  })
+                  tts = TextToSpeech(this) { tts?.language = Locale("bn", "BD") }
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+              }
+
+              private fun toggle() {
+                  listening = !listening
+                  if (listening) listen() else { recognizer?.destroy(); recognizer = null; status.text = "বন্ধ" }
+              }
+
+              private fun listen() {
+                  if (!listening) return
+                  recognizer?.destroy()
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                      setRecognitionListener(object : RecognitionListener {
+                          override fun onResults(r: Bundle?) {
+                              val t = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                              if (t != null) { status.text = t; handle(t) }
+                              ui.postDelayed({ listen() }, 600)
+                          }
+                          override fun onError(e: Int) { ui.postDelayed({ listen() }, 800) }
+                          override fun onReadyForSpeech(p: Bundle?) { status.text = "শুনছি..." }
+                          override fun onBeginningOfSpeech() {}
+                          override fun onRmsChanged(v: Float) {}
+                          override fun onBufferReceived(b: ByteArray?) {}
+                          override fun onEndOfSpeech() {}
+                          override fun onPartialResults(p: Bundle?) {}
+                          override fun onEvent(t: Int, p: Bundle?) {}
+                      })
+                      startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
+                      })
+                  }
+              }
+
+              private fun say(s: String) { status.text = s; tts?.speak(s, TextToSpeech.QUEUE_FLUSH, null, "a") }
+
+              private fun handle(raw: String) {
+                  val t = raw.lowercase().trim()
+                  val svc = AssistantService.instance
+                  val openWords = Regex("(খোলো|খুলো|খোল|ওপেন|open|চালাও|অ্যাপ|app)")
+                  val clickWords = Regex("(ক্লিক|চাপো|চাপ দাও|click|tap)")
+
+                  when {
+                      openWords.containsMatchIn(t) -> {
+                          val name = t.replace(openWords, "").trim()
+                          if (!openApp(name)) say("$name পাইনি")
+                      }
+                      svc == null && !t.contains("সেটিংস") -> say("আগে Accessibility চালু করুন")
+                      clickWords.containsMatchIn(t) -> {
+                          val target = t.replace(clickWords, "").trim()
+                          say(if (svc!!.clickByText(target)) "ঠিক আছে" else "$target পাইনি")
+                      }
+                      t.contains("হোম") || t.contains("home") -> svc!!.home()
+                      t.contains("ব্যাক") || t.contains("পিছনে") || t.contains("back") -> svc!!.back()
+                      t.contains("রিসেন্ট") || t.contains("recent") -> svc!!.recents()
+                      t.contains("নোটিফিকেশন") || t.contains("notification") -> svc!!.notifications()
+                      t.contains("নিচে") || t.contains("scroll down") -> svc!!.scroll(true)
+                      t.contains("উপরে") || t.contains("scroll up") -> svc!!.scroll(false)
+                      t.contains("স্ক্রিনশট") || t.contains("screenshot") -> svc!!.screenshot()
+                      t.contains("লক") -> svc!!.lock()
+                      else -> say("বুঝিনি: $raw")
+                  }
+              }
+
+              private fun openApp(query: String): Boolean {
+                  val q = aliases[query] ?: query
+                  val pm = packageManager
+                  val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val m = pm.queryIntentActivities(main, 0)
+                      .firstOrNull { it.loadLabel(pm).toString().lowercase().contains(q) } ?: return false
+                  val launch = pm.getLaunchIntentForPackage(m.activityInfo.packageName) ?: return false
+                  startActivity(launch)
+                  return true
+              }
+
+              override fun onDestroy() { recognizer?.destroy(); tts?.shutdown(); super.onDestroy() }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/voiceassistant
+          cat > app/src/main/java/com/example/voiceassistant/AssistantService.kt <<'EOF'
+          package com.example.voiceassistant
+
+          import android.accessibilityservice.AccessibilityService
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.os.Build
+
+          class AssistantService : AccessibilityService() {
+              companion object { var instance: AssistantService? = null }
+
+              override fun onServiceConnected() { instance = this }
+              override fun onUnbind(i: android.content.Intent?): Boolean { instance = null; return super.onUnbind(i) }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun home() = performGlobalAction(GLOBAL_ACTION_HOME)
+              fun back() = performGlobalAction(GLOBAL_ACTION_BACK)
+              fun recents() = performGlobalAction(GLOBAL_ACTION_RECENTS)
+              fun notifications() = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+              fun lock() { if (Build.VERSION.SDK_INT >= 28) performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN) }
+              fun screenshot() { if (Build.VERSION.SDK_INT >= 28) performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT) }
+
+              fun clickByText(text: String): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  var node: AccessibilityNodeInfo? = root.findAccessibilityNodeInfosByText(text).firstOrNull()
+                  while (node != null && !node.isClickable) node = node.parent
+                  return node?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
+              }
+
+              fun scroll(forward: Boolean): Boolean {
+                  val n = findScrollable(rootInActiveWindow) ?: return false
+                  return n.performAction(
+                      if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                      else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                  )
+              }
+
+              private fun findScrollable(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+                  if (n == null) return null
+                  if (n.isScrollable) return n
+                  for (i in 0 until n.childCount) findScrollable(n.getChild(i))?.let { return it }
+                  return null
+              }
+          }
+          EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc" />
+          EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="service_desc">ভয়েস কমান্ডে ফোন নিয়ন্ত্রণ</string>
+          </resources>
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-assistant-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
